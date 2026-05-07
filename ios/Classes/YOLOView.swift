@@ -1298,6 +1298,15 @@ public class YOLOView: UIView, VideoCaptureDelegate {
   }
 
   public func capturePhoto(completion: @escaping (UIImage?) -> Void) {
+    // Silent capture from the live video stream — avoids the iOS shutter sound
+    // that AVCapturePhotoOutput emits. The frame is already in the preview's
+    // orientation (see VideoCapture.captureCurrentFrame), so no additional
+    // rotation is applied here: portrait preview → portrait JPEG.
+    if let image = self.videoCapture.captureCurrentFrame() {
+      completion(image)
+      return
+    }
+    // Fallback if no video frame is available yet (e.g. camera just started).
     self.photoCaptureCompletion = completion
     let settings = AVCapturePhotoSettings()
     usleep(20_000)  // short 10 ms delay to allow camera to focus

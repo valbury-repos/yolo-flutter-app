@@ -60,6 +60,11 @@ class VideoCapture: NSObject, @unchecked Sendable {
 
   private var currentBuffer: CVPixelBuffer?
 
+  // Latest delivered sample buffer, used by `captureCurrentFrame()` to grab a
+  // still without triggering the AVCapturePhotoOutput shutter sound.
+  private var latestSampleBuffer: CMSampleBuffer?
+  private let bufferLock = NSLock()
+
   func setUp(
     sessionPreset: AVCaptureSession.Preset = .hd1280x720,
     position: AVCaptureDevice.Position,
@@ -303,8 +308,80 @@ extension VideoCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
     _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
+    bufferLock.lock()
+    latestSampleBuffer = sampleBuffer
+    bufferLock.unlock()
     guard inferenceOK else { return }
     predictOnFrame(sampleBuffer: sampleBuffer)
+  }
+
+  /// Returns the most recent video frame as a still UIImage without firing the
+  /// shutter sound. The frame is returned in the same orientation the preview
+  /// is showing, because the videoOutput connection is configured with
+  /// `videoOrientation` (and `isVideoMirrored` for the front camera) in
+  /// `setUpCamera`, so the delivered buffer is already rotated/mirrored to
+  /// match the preview.
+  ///
+  /// The buffer covers the camera's full field of view, but the preview uses
+  /// `videoGravity = .resizeAspectFill`, so it crops the buffer to fit the
+  /// view bounds. To make the JPEG match what the user saw on screen we crop
+  /// to the same region using `metadataOutputRectConverted`, which accounts
+  /// for the preview's gravity, orientation, and mirroring.
+  func captureCurrentFrame() -> UIImage? {
+    bufferLock.lock()
+    let bufferOrNil = latestSampleBuffer
+    bufferLock.unlock()
+    guard let sampleBuffer = bufferOrNil,
+      let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+    else {
+      return nil
+    }
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    let context = CIContext()
+    guard let fullCgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+      return nil
+    }
+
+    if let previewLayer = self.previewLayer, !previewLayer.bounds.isEmpty {
+      var bufferW = CGFloat(fullCgImage.width)
+      var bufferH = CGFloat(fullCgImage.height)
+      let previewW = previewLayer.bounds.width
+      let previewH = previewLayer.bounds.height
+
+      // If the buffer wasn't actually rotated to the preview's orientation
+      // (some iOS versions / pixel formats ignore connection.videoOrientation
+      // on AVCaptureVideoDataOutput), rotate the CGImage to match the preview
+      // before computing the crop. Otherwise the aspect-ratio math below would
+      // be off, and the JPEG would still cover a wider FOV than the preview.
+      let bufferIsPortrait = bufferH > bufferW
+      let previewIsPortrait = previewH > previewW
+      var workingCgImage = fullCgImage
+      if bufferIsPortrait != previewIsPortrait {
+        let rotatedCi = CIImage(cgImage: fullCgImage).oriented(.right)
+        if let rotated = context.createCGImage(rotatedCi, from: rotatedCi.extent) {
+          workingCgImage = rotated
+          bufferW = CGFloat(rotated.width)
+          bufferH = CGFloat(rotated.height)
+        }
+      }
+
+      // Replicate `videoGravity = .resizeAspectFill`: scale buffer so it fills
+      // the preview, then center-crop the overflow.
+      let scale = max(previewW / bufferW, previewH / bufferH)
+      let cropW = previewW / scale
+      let cropH = previewH / scale
+      let cropX = (bufferW - cropW) / 2.0
+      let cropY = (bufferH - cropH) / 2.0
+      let cropRect = CGRect(x: cropX, y: cropY, width: cropW, height: cropH)
+        .intersection(CGRect(x: 0, y: 0, width: bufferW, height: bufferH))
+
+      if !cropRect.isEmpty, let croppedCgImage = workingCgImage.cropping(to: cropRect) {
+        return UIImage(cgImage: croppedCgImage, scale: 1.0, orientation: .up)
+      }
+      return UIImage(cgImage: workingCgImage, scale: 1.0, orientation: .up)
+    }
+
+    return UIImage(cgImage: fullCgImage, scale: 1.0, orientation: .up)
   }
 }
 
