@@ -180,6 +180,37 @@ class VideoCapture: NSObject, @unchecked Sendable {
     do {
       try device.lockForConfiguration()
 
+      // Force highest-resolution 4:3 video format so AVCaptureVideoDataOutput
+      // buffers match the photo preset's quality. Without this, video buffers
+      // come at the session preset's video dimensions (~1920×1080 even when
+      // sessionPreset is .photo), making captureCurrentFrame emit a low-res
+      // still. Setting activeFormat overrides sessionPreset on the device.
+      let best43Format = device.formats
+        .filter {
+          let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+          return abs(Double(d.width) / Double(d.height) - 4.0 / 3.0) < 0.01
+        }
+        .max {
+          let a = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+          let b = CMVideoFormatDescriptionGetDimensions($1.formatDescription)
+          return Int(a.width) * Int(a.height) < Int(b.width) * Int(b.height)
+        }
+      if let best43Format = best43Format {
+        let dims = CMVideoFormatDescriptionGetDimensions(best43Format.formatDescription)
+        NSLog("YOLO VideoCapture: activeFormat -> %dx%d", dims.width, dims.height)
+        device.activeFormat = best43Format
+        // activeFormat resets frame-duration ranges; clamp to 30fps so YOLO
+        // inference doesn't choke on >30fps from high-end formats.
+        let thirtyFps = CMTime(value: 1, timescale: 30)
+        let supports30 = best43Format.videoSupportedFrameRateRanges.contains {
+          $0.minFrameDuration <= thirtyFps && $0.maxFrameDuration >= thirtyFps
+        }
+        if supports30 {
+          device.activeVideoMinFrameDuration = thirtyFps
+          device.activeVideoMaxFrameDuration = thirtyFps
+        }
+      }
+
       if device.isFocusModeSupported(AVCaptureDevice.FocusMode.continuousAutoFocus),
         device.isFocusPointOfInterestSupported
       {
